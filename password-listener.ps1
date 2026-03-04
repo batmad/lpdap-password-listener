@@ -47,6 +47,16 @@ while ($true) {
                 Where-Object { $_.Name -eq "SubjectUserName" } |
                 Select-Object -ExpandProperty '#text'
 
+            # Skip computer, system, and service accounts
+            if (
+                [string]::IsNullOrWhiteSpace($targetUser) -or
+                $targetUser -like '*$' -or
+                $subjectUser -like '*$' -or
+                $targetUser -eq 'SYSTEM'
+            ) {
+                continue
+            }
+            
             $payload = @{
                 event_id        = $event.Id
                 event_record_id = $event.RecordId
