@@ -11,76 +11,80 @@ Write-Host "Password Listener Started on $DCName..."
 # ==============================
 # LOAD LAST RECORD ID
 # ==============================
-if (Test-Path $StateFile) {
-    $lastRecordId = [int64](Get-Content $StateFile)
-} else {
-    $lastRecordId = 0
-}
+$lastRecordId = if (Test-Path $StateFile) { [int64](Get-Content $StateFile -Raw).Trim() } else { 0 }
+
+# Pre-build headers sekali saja (tidak dibuat ulang tiap iterasi)
+$headers = @{ "Authorization" = "Bearer $ApiKey" }
 
 # ==============================
-# MAIN LOOP (Polling 5 detik)
+# MAIN LOOP
 # ==============================
 while ($true) {
-
     try {
+        # Gunakan -FilterXPath untuk filter langsung di level WinEvent (lebih efisien)
+        $xpath = "*[System[(EventID=4723 or EventID=4724) and EventRecordID > $lastRecordId]]"
+        
+        $events = Get-WinEvent -LogName 'Security' -FilterXPath $xpath -MaxEvents 50 -ErrorAction SilentlyContinue
 
-        $events = Get-WinEvent -FilterHashtable @{
-            LogName='Security'
-            Id=4723,4724
-        } -MaxEvents 50
+        if ($events) {
+            # Sort dan proses
+            foreach ($event in ($events | Sort-Object RecordId)) {
+                try {
+                    $xml = [xml]$event.ToXml()
+                    $data = $xml.Event.EventData.Data
 
-        foreach ($event in $events | Sort-Object RecordId) {
+                    $targetUser  = ($data | Where-Object { $_.Name -eq "TargetUserName" }).'#text'
+                    $subjectUser = ($data | Where-Object { $_.Name -eq "SubjectUserName" }).'#text'
 
-            if ($event.RecordId -le $lastRecordId) {
-                continue
+                    # Bebaskan XML object segera setelah dipakai
+                    $xml = $null
+
+                    # Skip akun komputer, system, service
+                    if ([string]::IsNullOrWhiteSpace($targetUser) -or
+                        $targetUser -like '*$' -or
+                        $subjectUser -like '*$' -or
+                        $targetUser -eq 'SYSTEM') {
+                        $lastRecordId = $event.RecordId
+                        continue
+                    }
+
+                    $payload = [ordered]@{
+                        event_id        = $event.Id
+                        event_record_id = $event.RecordId
+                        target_user     = $targetUser
+                        changed_by      = $subjectUser
+                        dc_name         = $DCName
+                        event_time      = $event.TimeCreated.ToString("o") # ISO 8601
+                    } | ConvertTo-Json -Depth 3 -Compress
+
+                    Invoke-RestMethod -Uri $ApiUrl `
+                        -Method POST `
+                        -Headers $headers `
+                        -ContentType "application/json" `
+                        -Body $payload | Out-Null
+
+                    $lastRecordId = $event.RecordId
+                    $lastRecordId | Out-File $StateFile -Force -NoNewline
+
+                    Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] Event Sent: $($event.Id) - $targetUser"
+                }
+                catch {
+                    Write-Host "Error processing event $($event.RecordId): $_"
+                }
+                finally {
+                    $xml = $null
+                }
             }
-
-            $lastRecordId = $event.RecordId
-
-            $xml = [xml]$event.ToXml()
-
-            $targetUser = $xml.Event.EventData.Data |
-                Where-Object { $_.Name -eq "TargetUserName" } |
-                Select-Object -ExpandProperty '#text'
-
-            $subjectUser = $xml.Event.EventData.Data |
-                Where-Object { $_.Name -eq "SubjectUserName" } |
-                Select-Object -ExpandProperty '#text'
-
-            # Skip computer, system, and service accounts
-            if (
-                [string]::IsNullOrWhiteSpace($targetUser) -or
-                $targetUser -like '*$' -or
-                $subjectUser -like '*$' -or
-                $targetUser -eq 'SYSTEM'
-            ) {
-                continue
-            }
-            
-            $payload = @{
-                event_id        = $event.Id
-                event_record_id = $event.RecordId
-                target_user     = $targetUser
-                changed_by      = $subjectUser
-                dc_name         = $DCName
-                event_time      = $event.TimeCreated
-            } | ConvertTo-Json -Depth 5
-
-            Invoke-RestMethod -Uri $ApiUrl `
-                -Method POST `
-                -Headers @{ "Authorization" = "Bearer $ApiKey" } `
-                -ContentType "application/json" `
-                -Body $payload
-
-            # Save last processed RecordId
-            $lastRecordId | Out-File $StateFile -Force
-
-            Write-Host "Event Sent: $($event.Id) - $targetUser"
-
         }
-
-    } catch {
-        Write-Host "Error: $_"
+    }
+    catch {
+        Write-Host "Error fetching events: $_"
+    }
+    finally {
+        # Paksa release memory setiap loop
+        $events = $null
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
     }
 
     Start-Sleep -Seconds 5
